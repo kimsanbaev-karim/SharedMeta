@@ -2443,6 +2443,24 @@ builder.Services.AddSignalR().AddMetaMessagePackProtocol();
 app.MapHub<MetaHub>("/meta");
 ```
 
+**Per-caller rate limiting (optional):**
+```csharp
+builder.Services.AddSignalR()
+    .AddMetaMessagePackProtocol()
+    .AddMetaHubRateLimiting(o =>
+    {
+        o.PermitLimit = 60;                    // calls per window, per caller
+        o.Window = TimeSpan.FromSeconds(1);
+        o.ExemptMethods.Add("MyOwnHandshake"); // SessionConnect and friends are exempt already
+    });
+```
+
+The ASP.NET Core rate limiting middleware does not cover this: it runs on HTTP requests, and once the transport upgrades, every RPC travels inside one long-lived connection the middleware never sees again. `AddMetaHubRateLimiting` installs a hub filter — the layer that does see each invocation — backed by `System.Threading.RateLimiting`, and refuses the excess with a `HubException`.
+
+The partition key is the authenticated identity (`sub` / `NameIdentifier`) when there is one, and the connection id otherwise. The client-supplied `PlayerId` is deliberately not used as a key: a flooder would rotate it and get a fresh budget every time. Handshake and acknowledgement methods are exempt by default — throttling them turns a reconnect storm into clients that cannot get back in.
+
+Note this is a fairness and abuse control, not DDoS protection: a distributed flood is absorbed upstream (WAF / CDN / your host's protection), not by the silo.
+
 **Client (JSON protocol — default, no extra packages):** reference `CoreGame.SharedMeta.Transport.SignalR.Client` (.NET / Godot / console; Unity gets `SignalRConnection` from the UPM package).
 ```csharp
 var connection = new SignalRConnection(
