@@ -3,6 +3,7 @@ using System.Text;
 using System.Linq;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using SharedMeta.Generator.Utilities;
 
 namespace SharedMeta.Generator.Generators
 {
@@ -107,6 +108,12 @@ namespace SharedMeta.Generator.Generators
             sb.AppendLine("using SharedMeta.Client;");
             sb.AppendLine($"using {namespaceName};");
             sb.AppendLine($"using {namespaceName}.Client;");
+            ImplDeclaredMethods.EmitSignatureUsings(sb, symbol, compilation, alreadyEmitted: new[]
+            {
+                "System", "System.Collections.Generic", "System.Threading.Tasks",
+                "SharedMeta.Core", "SharedMeta.Core.Network", "SharedMeta.Core.Diagnostics",
+                "SharedMeta.Core.Random", "SharedMeta.Core.Patch", "SharedMeta.Client", namespaceName,
+            });
             sb.AppendLine();
             sb.AppendLine($"namespace {namespaceName}.DependencyInjection");
             sb.AppendLine("{");
