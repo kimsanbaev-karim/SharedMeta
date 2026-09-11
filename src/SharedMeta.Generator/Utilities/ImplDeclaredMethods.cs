@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using System.Runtime.CompilerServices;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
@@ -176,12 +177,40 @@ namespace SharedMeta.Generator.Utilities
         {
             var namespaces = new SortedSet<string>(System.StringComparer.Ordinal);
             foreach (var method in ForService(serviceInterface, compilation))
-            {
-                CollectNamespaces(method.Symbol.ReturnType, namespaces);
-                foreach (var parameter in method.Symbol.Parameters)
-                    CollectNamespaces(parameter.Type, namespaces);
-            }
+                CollectSignature(method.Symbol, namespaces);
+
+            // The interface-declared members need the same treatment: their names were written
+            // against the using set of the interface file, and an enum that a game keeps beside its
+            // models resolves there and nowhere else.
+            foreach (var declaring in serviceInterface.AllInterfaces.Concat(new[] { serviceInterface }))
+            foreach (var method in declaring.GetMembers().OfType<IMethodSymbol>())
+                CollectSignature(method, namespaces);
+
             return namespaces.ToList();
+        }
+
+        /// <summary>
+        /// Writes the using directives a generated file needs to name the service's signature types
+        /// the short way the source did. Every generator that prints a signature into a namespace of
+        /// its own needs this, so the emit lives beside the collection rather than in one of them.
+        /// </summary>
+        public static void EmitSignatureUsings(
+            StringBuilder sb, INamedTypeSymbol serviceInterface, Compilation? compilation, string[] alreadyEmitted)
+        {
+            if (compilation == null) return;
+
+            foreach (var ns in SignatureNamespacesForService(serviceInterface, compilation))
+            {
+                if (System.Array.IndexOf(alreadyEmitted, ns) >= 0) continue;
+                sb.AppendLine($"using {ns};");
+            }
+        }
+
+        private static void CollectSignature(IMethodSymbol method, SortedSet<string> into)
+        {
+            CollectNamespaces(method.ReturnType, into);
+            foreach (var parameter in method.Parameters)
+                CollectNamespaces(parameter.Type, into);
         }
 
         private static void CollectNamespaces(ITypeSymbol type, SortedSet<string> into)
