@@ -34,6 +34,7 @@ public class MetaHubRateLimitFilterTests : IAsyncLifetime
 
     private const int PERMITS = 3;
     private const int PORT = 5211;
+    private const int LOOPBACK_EXEMPT_PORT = 5212;
 
     private WebApplication _app = null!;
 
@@ -41,19 +42,7 @@ public class MetaHubRateLimitFilterTests : IAsyncLifetime
     {
         CountingHub.Served = 0;
 
-        var builder = WebApplication.CreateBuilder();
-        builder.WebHost.UseUrls($"http://127.0.0.1:{PORT}");
-        builder.Logging.ClearProviders();
-        builder.Services.AddSignalR().AddMetaHubRateLimiting(o =>
-        {
-            o.PermitLimit = PERMITS;
-            o.Window = TimeSpan.FromMinutes(5);
-        });
-
-        _app = builder.Build();
-        _app.MapHub<CountingHub>("/counting");
-
-        await _app.StartAsync();
+        _app = await StartHostAsync(PORT, exemptLoopback: false);
     }
 
     public async Task DisposeAsync()
@@ -113,9 +102,51 @@ public class MetaHubRateLimitFilterTests : IAsyncLifetime
         Assert.Equal(PERMITS * 5, CountingHub.Served);
     }
 
-    private async Task<HubConnection> ConnectAsync()
+    [Fact(Timeout = 60_000)]
+    public async Task LoopbackIsExempt_ALocalToolKeepsCallingPastTheBudget()
     {
-        var connection = new HubConnectionBuilder().WithUrl($"http://127.0.0.1:{PORT}/counting").Build();
+        var app = await StartHostAsync(LOOPBACK_EXEMPT_PORT, exemptLoopback: true);
+        try
+        {
+            await using var local = await ConnectAsync(LOOPBACK_EXEMPT_PORT);
+
+            for (var i = 0; i < PERMITS * 5; i++)
+            {
+                await local.InvokeAsync<int>(nameof(CountingHub.RpcCall));
+            }
+
+            Assert.Equal(PERMITS * 5, CountingHub.Served);
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    private static async Task<WebApplication> StartHostAsync(int port, bool exemptLoopback)
+    {
+        var builder = WebApplication.CreateBuilder();
+        builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
+        builder.Logging.ClearProviders();
+        builder.Services.AddSignalR().AddMetaHubRateLimiting(o =>
+        {
+            o.PermitLimit = PERMITS;
+            o.Window = TimeSpan.FromMinutes(5);
+            o.ExemptLoopback = exemptLoopback;
+        });
+
+        var app = builder.Build();
+        app.MapHub<CountingHub>("/counting");
+
+        await app.StartAsync();
+
+        return app;
+    }
+
+    private static async Task<HubConnection> ConnectAsync(int port = PORT)
+    {
+        var connection = new HubConnectionBuilder().WithUrl($"http://127.0.0.1:{port}/counting").Build();
         await connection.StartAsync();
 
         return connection;

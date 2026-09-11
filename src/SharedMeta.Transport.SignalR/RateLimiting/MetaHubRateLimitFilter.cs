@@ -1,4 +1,5 @@
 using System;
+using System.Net;
 using System.Security.Claims;
 using System.Threading.RateLimiting;
 using System.Threading.Tasks;
@@ -37,6 +38,9 @@ namespace SharedMeta.Transport.SignalR.RateLimiting
             if (_options.ExemptMethods.Contains(invocationContext.HubMethodName))
                 return await next(invocationContext);
 
+            if (_options.ExemptLoopback && IsLoopback(invocationContext))
+                return await next(invocationContext);
+
             using var lease = await _limiter.AcquireAsync(invocationContext, 1);
             if (lease.IsAcquired) return await next(invocationContext);
 
@@ -49,6 +53,18 @@ namespace SharedMeta.Transport.SignalR.RateLimiting
         public void Dispose()
         {
             _limiter.Dispose();
+        }
+
+        private static bool IsLoopback(HubInvocationContext context)
+        {
+            var address = context.Context.GetHttpContext()?.Connection.RemoteIpAddress;
+            if (address == null) return false;
+
+            // A client on the same machine often arrives as ::ffff:127.0.0.1, and IPAddress.IsLoopback
+            // says no to that form, so unwrap it first.
+            if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
+
+            return IPAddress.IsLoopback(address);
         }
 
         private RateLimitPartition<string> CreatePartition(HubInvocationContext context)

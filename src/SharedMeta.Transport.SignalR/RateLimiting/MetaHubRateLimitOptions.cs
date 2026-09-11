@@ -29,6 +29,19 @@ namespace SharedMeta.Transport.SignalR.RateLimiting
         public int QueueLimit { get; set; }
 
         /// <summary>
+        /// Let calls arriving from a loopback address (127.0.0.0/8, ::1) through without spending a
+        /// permit — for admin tooling, health probes and integration tests that share the machine
+        /// with the silo.
+        /// <para>
+        /// Off by default, and that default is deliberate: behind a reverse proxy on the same host
+        /// every player's connection also arrives from loopback, so switching this on there disables
+        /// the limit for the entire internet. Turn it on only when the silo is reached directly, or
+        /// after the host is configured to restore the real client address (forwarded headers).
+        /// </para>
+        /// </summary>
+        public bool ExemptLoopback { get; set; }
+
+        /// <summary>
         /// Methods that bypass the limit entirely. The handshake and the acknowledgement path are
         /// exempt by default: throttling them turns a reconnect storm - exactly what happens after a
         /// server restart - into a queue of clients that cannot get back in.
