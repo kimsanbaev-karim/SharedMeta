@@ -2066,12 +2066,7 @@ namespace SharedMeta.Generator.Generators
         private static void EmitImplDeclaredUsings(
             StringBuilder sb, INamedTypeSymbol symbol, Compilation? compilation, string[] alreadyEmitted)
         {
-            if (compilation == null) return;
-            foreach (var ns in ImplDeclaredMethods.SignatureNamespacesForService(symbol, compilation))
-            {
-                if (System.Array.IndexOf(alreadyEmitted, ns) >= 0) continue;
-                sb.AppendLine($"using {ns};");
-            }
+            ImplDeclaredMethods.EmitSignatureUsings(sb, symbol, compilation, alreadyEmitted);
         }
 
         /// <summary>
