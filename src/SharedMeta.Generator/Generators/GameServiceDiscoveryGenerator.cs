@@ -487,25 +487,40 @@ namespace SharedMeta.Generator.Generators
             sb.AppendLine("    }   // close GameServiceDiscoveryBase");
             sb.AppendLine("}   // close rootNamespace");
             sb.AppendLine();
-            sb.AppendLine($"namespace {rootNamespace}.Generated");
-            sb.AppendLine("{");
-            sb.AppendLine("    /// <summary>");
-            sb.AppendLine("    /// Compile-time table of client-side method ids. Each constant equals the");
-            sb.AppendLine("    /// method's <c>GlobalIndex</c> in the client signature's KnownMethods.");
-            sb.AppendLine("    /// Generated client code passes these into <c>RpcCall.MethodId</c> on the wire.");
-            sb.AppendLine("    /// </summary>");
-            sb.AppendLine("    public static class GameMethodIds");
-            sb.AppendLine("    {");
-            ushort kIdx = 0;
-            foreach (var s in sorted)
+            // The table is emitted into every namespace that declares a service, not just the root
+            // one. Consumers address it as {their own namespace}.Generated.GameMethodIds — that name
+            // resolves only while all services share one namespace, and a game that keeps its
+            // services apart (heroes here, profile there) would otherwise get a dispatcher pointing
+            // at a table that does not exist. Same ids in every copy: the ordering is global.
+            var tableNamespaces = services
+                .Select(s => s.Namespace)
+                .Concat(new[] { rootNamespace })
+                .Where(ns => !string.IsNullOrEmpty(ns))
+                .Distinct()
+                .OrderBy(ns => ns);
+
+            foreach (var tableNamespace in tableNamespaces)
             {
-                var safeName = SignatureHashGenerator.MakeMethodIdConstName(s.ServiceName, s.MethodAlias, s.Version);
-                sb.AppendLine($"        public const ushort {safeName} = {kIdx};");
-                kIdx++;
+                sb.AppendLine($"namespace {tableNamespace}.Generated");
+                sb.AppendLine("{");
+                sb.AppendLine("    /// <summary>");
+                sb.AppendLine("    /// Compile-time table of client-side method ids. Each constant equals the");
+                sb.AppendLine("    /// method's <c>GlobalIndex</c> in the client signature's KnownMethods.");
+                sb.AppendLine("    /// Generated client code passes these into <c>RpcCall.MethodId</c> on the wire.");
+                sb.AppendLine("    /// </summary>");
+                sb.AppendLine("    public static class GameMethodIds");
+                sb.AppendLine("    {");
+                ushort kIdx = 0;
+                foreach (var s in sorted)
+                {
+                    var safeName = SignatureHashGenerator.MakeMethodIdConstName(s.ServiceName, s.MethodAlias, s.Version);
+                    sb.AppendLine($"        public const ushort {safeName} = {kIdx};");
+                    kIdx++;
+                }
+                sb.AppendLine("    }");
+                sb.AppendLine("}");
+                sb.AppendLine();
             }
-            sb.AppendLine("    }");
-            sb.AppendLine("}");
-            sb.AppendLine();
 
             // 0.24.0+ Auto-publish ClientSignature into MetaClientSignature.Default so consumers
             // don't have to wire MetaClientOptions.ClientSignature by hand (0.24 dispatch requires
