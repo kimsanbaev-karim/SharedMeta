@@ -12,6 +12,40 @@ namespace SharedMeta.Generator
     [Generator]
     public class SharedMetaGenerator : IIncrementalGenerator
     {
+        /// <summary>
+        /// The namespace that holds the once-per-assembly generated types (discovery base, server
+        /// configuration, method-id table): the longest namespace prefix every service shares.
+        /// <para>
+        /// Taking whichever service was seen first breaks a game that spreads its services over
+        /// several namespaces - the pipelines here run per compilation and disagree about which one
+        /// came first, so the shared assembly emits GameServiceDiscoveryBase in one namespace while
+        /// the server assembly looks for it in another. The common prefix is the same answer for
+        /// every pipeline, and it lands where a reader expects the game's own root to be.
+        /// </para>
+        /// </summary>
+        private static string PickRootNamespace(IEnumerable<string> namespaces)
+        {
+            var declared = namespaces
+                .Where(ns => !string.IsNullOrEmpty(ns))
+                .Distinct()
+                .OrderBy(ns => ns, StringComparer.Ordinal)
+                .ToList();
+
+            var shared = declared[0].Split('.').ToList();
+            foreach (var candidate in declared.Skip(1))
+            {
+                var segments = candidate.Split('.');
+                while (shared.Count > 0 &&
+                       (shared.Count > segments.Length ||
+                        !shared[shared.Count - 1].Equals(segments[shared.Count - 1], StringComparison.Ordinal)))
+                {
+                    shared.RemoveAt(shared.Count - 1);
+                }
+            }
+
+            return shared.Count == 0 ? declared[0] : string.Join(".", shared);
+        }
+
         public void Initialize(IncrementalGeneratorInitializationContext context)
         {
             // Debugging helper: Uncomment to launch debugger
@@ -251,7 +285,7 @@ namespace SharedMeta.Generator
                     .Any(a => a.Name == "SharedMeta.Server.Core");
                 if (isServerProject) return; // handled by the assembly-scan pipeline below
 
-                var rootNamespace = valid.First().ImplNamespace;
+                var rootNamespace = PickRootNamespace(valid.Select(v => v.ImplNamespace));
                 var source = StatelessServiceGenerator.GenerateVersionSource(rootNamespace, valid, wrapped: true);
                 spc.AddSource("GeneratedStatelessConfigVersionSource.g.cs", source);
             });
@@ -290,7 +324,7 @@ namespace SharedMeta.Generator
 
                 if (infos.Count == 0) return;
 
-                var rootNamespace = infos.First().ImplNamespace;
+                var rootNamespace = PickRootNamespace(infos.Select(i => i.ImplNamespace));
                 var source = StatelessServiceGenerator.GenerateVersionSource(rootNamespace, infos, wrapped: false);
                 spc.AddSource("GeneratedStatelessConfigVersionSource.g.cs", source);
             });
@@ -348,8 +382,7 @@ namespace SharedMeta.Generator
                 var validServices = services.Where(s => s != null && s!.StateTypeFullName != null).ToList()!;
                 if (validServices.Count == 0) return;
 
-                // Use the first namespace as the root namespace for the discovery class
-                var rootNamespace = validServices.First()!.Namespace;
+                var rootNamespace = PickRootNamespace(validServices.Select(s => s!.Namespace));
 
                 var source = GameServiceDiscoveryGenerator.Generate(rootNamespace, validServices!);
                 if (!string.IsNullOrEmpty(source))
@@ -378,7 +411,7 @@ namespace SharedMeta.Generator
                 var validServices = services.Where(s => s != null).ToList()!;
                 if (validServices.Count == 0) return;
 
-                var rootNamespace = validServices.First()!.Namespace;
+                var rootNamespace = PickRootNamespace(validServices.Select(s => s!.Namespace));
 
                 var source = ClientServiceAggregateGenerator.Generate(rootNamespace, validServices!);
                 if (!string.IsNullOrEmpty(source))
@@ -449,7 +482,7 @@ namespace SharedMeta.Generator
                 // Resolve DefaultConfig references
                 ServerMetaConfigurationGenerator.ResolveDefaultConfigs(validImpls!, compilation);
 
-                var rootNamespace = validImpls.First()!.Namespace;
+                var rootNamespace = PickRootNamespace(validImpls.Select(i => i!.Namespace));
                 // 0.27.0+ Auto-emit AddSharedMetaConfigProvider<T>() only when the
                 // SharedMeta.Orleans assembly is referenced — pure SharedMeta.Server.Core hosts
                 // (tests, in-proc backends, alternative registries) don't see those calls.
@@ -505,7 +538,7 @@ namespace SharedMeta.Generator
                 // Resolve DefaultConfig references
                 ServerMetaConfigurationGenerator.ResolveDefaultConfigs(implInfos, compilation);
 
-                var rootNamespace = implInfos.First().Namespace;
+                var rootNamespace = PickRootNamespace(implInfos.Select(i => i.Namespace));
                 var hasOrleansConfig = compilation.ReferencedAssemblyNames
                     .Any(a => a.Name == "SharedMeta.Orleans");
                 var source = ServerMetaConfigurationGenerator.GenerateForServerProject(rootNamespace, implInfos, hasOrleansConfig);
