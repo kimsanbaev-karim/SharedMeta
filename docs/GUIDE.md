@@ -2360,6 +2360,8 @@ The ASP.NET Core rate limiting middleware does not cover this: it runs on HTTP r
 
 The partition key is the authenticated identity (`sub` / `NameIdentifier`) when there is one, and the connection id otherwise. The client-supplied `PlayerId` is deliberately not used as a key: a flooder would rotate it and get a fresh budget every time. Handshake and acknowledgement methods are exempt by default — throttling them turns a reconnect storm into clients that cannot get back in.
 
+`ExemptLoopback = true` additionally lets calls from `127.0.0.0/8` and `::1` through without spending a permit — for admin tooling, health probes and integration tests that share the machine with the silo. It is off by default on purpose: behind a reverse proxy on the same host every player's connection also arrives from loopback, so switching it on there disables the limit for the entire internet. Turn it on only when the silo is reached directly, or after the host is configured to restore the real client address (forwarded headers).
+
 Note this is a fairness and abuse control, not DDoS protection: a distributed flood is absorbed upstream (WAF / CDN / your host's protection), not by the silo.
 
 **Client (JSON protocol — default, no extra packages):** reference `CoreGame.SharedMeta.Transport.SignalR.Client` (.NET / Godot / console; Unity gets `SignalRConnection` from the UPM package).
