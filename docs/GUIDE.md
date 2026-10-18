@@ -1057,6 +1057,8 @@ Raised after the connection was dropped and its clients disposed — by either `
 
 This replaces the old behaviour, where a captured client kept sending successfully and silently stopped receiving, freezing its state mirror while every call reported success.
 
+**Concurrent resolves.** Any number of `GetServiceAsync` / `MetaRef<T>.GetAsync()` calls for one entity may run at once — e.g. a `MetaConnectedEvent` handler and UI init both reaching for the same clan chat. They share a single subscribe, and every caller asking for the same API client type gets the same instance. If the entity is disconnected (`DisconnectAsync` or the supersede restart) while that subscribe is still in flight, every waiting resolve fails at once with `OperationCanceledException` and nothing is cached; resolve again when you need the entity back. A failed subscribe isn't cached either — the next resolve retries.
+
 ### CrossOptimistic Mode
 
 Optimistic execution across **multiple states owned by the same player** — the split-profile pattern. When one player's data has grown large enough to be split across several `ISharedState` entities (e.g. `ProfileState` + `InventoryState` + `QuestState`, all keyed by the player's id), `CrossOptimistic` lets the client execute methods that touch more than one of those states locally without waiting for a round-trip.

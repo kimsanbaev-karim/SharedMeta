@@ -41,6 +41,9 @@ namespace SharedMeta.Client
         // inner key is the connection's StateType. Use the TryGetConnection/SetConnection/
         // RemoveConnection/GetConnectionsForEntity helpers below instead of touching this directly.
         private readonly Dictionary<string, Dictionary<Type, EntityConnection>> _connections = new();
+        // Subscribes in flight, same identity as _connections. An entry exists only until its
+        // connection lands in _connections (or the subscribe fails / is cancelled by a disconnect).
+        private readonly Dictionary<(string EntityId, Type StateType), PendingSubscribe> _pendingSubscribes = new();
         // Provider registered per TConfig type — single point of materialization for entity
         // configs at subscribe time. Replaces the pre-0.14.0 cache + downloader + URL factory +
         // bundled-factory chain. Keyed by typeof(TConfig); values are typed closures that the
@@ -326,147 +329,51 @@ namespace SharedMeta.Client
         public async Task<TApiClient> GetServiceAsync<TApiClient>(string entityId) where TApiClient : class
         {
             var config = GetConfig<TApiClient>();
-            EntityConnection? existingConnection = null;
 
             lock (_lock)
             {
-                // Check if already connected under this exact state type — a second, different
-                // state type sharing the same entityId is a distinct, independent connection.
-                if (TryGetConnection(entityId, config.StateType, out existingConnection))
-                {
-                    // Check if this specific API client already exists
-                    if (existingConnection.ApiClients.TryGetValue(typeof(TApiClient), out var existingClient))
-                    {
-                        return (TApiClient)existingClient;
-                    }
-                }
+                // A second, different state type sharing the same entityId is a distinct,
+                // independent connection — the lookup is by exact state type.
+                if (TryGetConnection(entityId, config.StateType, out var cached)
+                    && cached.ApiClients.TryGetValue(typeof(TApiClient), out var existingClient))
+                    return (TApiClient)existingClient;
             }
 
-            // Get or create network connection
-            INetwork network;
-            IEntityStateContainer stateContainer;
-            MetaRandom? optimisticRandom = null;
-            MetaRandom[]? namedRandoms = null;
-            object? entityConfig = null;
-            IReadOnlyList<object>? serviceConfigs = null;
-            EntityConnection? newConnection = null;
+            var (connection, _) = await GetOrSubscribeConnectionAsync(entityId, config);
 
-            if (existingConnection != null)
-            {
-                // Reuse existing network, container, random, and config — every API client on this
-                // entity must observe the same state, even after a wholesale ServerReplace.
-                network = existingConnection.Network;
-                stateContainer = existingConnection.StateContainer;
-                optimisticRandom = existingConnection.OptimisticRandom;
-                namedRandoms = existingConnection.NamedRandoms;
-                entityConfig = existingConnection.Config;
-                serviceConfigs = existingConnection.Configs;
-            }
-            else
-            {
-                // Create new connection - pass stateTypeName so factory can call Subscribe
-                var stateTypeName = config.StateType.FullName ?? config.StateType.Name;
-                var subResult = await _networkFactory(entityId, stateTypeName);
-                network = subResult.Network;
-
-                object initialState;
-                if (subResult.StateBytes != null && subResult.StateBytes.Length > 0)
-                {
-                    initialState = _serializer.Unpack(config.StateType, subResult.StateBytes)
-                        ?? throw new InvalidOperationException($"Failed to deserialize state of type '{config.StateType.Name}'");
-                }
-                else
-                {
-                    initialState = Activator.CreateInstance(config.StateType)
-                        ?? throw new InvalidOperationException($"Failed to create state of type '{config.StateType.Name}'");
-                }
-
-                stateContainer = CreateContainer(config, initialState);
-
-                // Deserialize optimistic random, or create from entityId seed
-                if (subResult.OptimisticRandomBytes != null && subResult.OptimisticRandomBytes.Length > 0)
-                {
-                    optimisticRandom = _serializer.Unpack<MetaRandom>(subResult.OptimisticRandomBytes);
-                }
-                else
-                {
-                    optimisticRandom = MetaRandom.FromString(entityId + ":optimistic");
-                }
-
-                // Deserialize named randoms (null when state has no [NamedRandom] declarations)
-                if (subResult.NamedRandomsBytes is { Length: > 0 } nrBytes)
-                {
-                    namedRandoms = _serializer.Unpack<MetaRandom[]>(nrBytes);
-                }
-
-                // Resolve config: check cache → request URL → download → fallback to factory
-                entityConfig = await ResolveConfigAsync(config, subResult, entityId);
-                serviceConfigs = await ResolveServiceConfigsAsync(config, subResult, entityId);
-
-                newConnection = new EntityConnection
-                {
-                    EntityId = entityId,
-                    Network = network,
-                    StateType = config.StateType,
-                    StateContainer = stateContainer,
-                    OptimisticRandom = optimisticRandom,
-                    NamedRandoms = namedRandoms,
-                    Config = entityConfig,
-                    ConfigType = config.ConfigType,
-                    ConfigVersions = subResult.ConfigVersions,
-                    Configs = serviceConfigs,
-                };
-
-                // 0.21.0: hook the version-specific config fetcher so drift detection
-                // (broadcasts carrying a different ExecutedConfigVersion than the session)
-                // can lazily materialize the right config for replay.
-                if (config.ConfigType != null && _configProviders.TryGetValue(config.ConfigType, out var versionFetcher))
-                    newConnection.VersionedConfigFetcher = versionFetcher;
-
-                // Entity-level broadcast handler: applies state-data (StateBytes / PatchBytes) to the
-                // shared container regardless of which service the broadcast came from. This is what
-                // lets a client that subscribed to only one of several services on the entity still
-                // receive every state update.
-                newConnection.SubscribeBroadcasts(_serializer, ResolvePatchApplier(config), LookupConfigByMethodId, this, InstallStateResync);
-            }
-
-            // Create API client using factory — pass the container as the third positional arg.
-            // The generated client casts it to EntityStateContainer<TState> internally.
-            // 0.21.0: pass connection.ResolveConfigForBroadcast as configResolver so the client's
-            // broadcast-replay path can materialize the right config when the server's
-            // ExecutedConfigVersion drifts from the session pin. existingConnection / newConnection
-            // exposes it; if neither (rare race), we fall back to no resolver (session config only).
-            var activeConnectionForResolver = existingConnection ?? newConnection;
-            Func<MetaConfigVersion, object?>? configResolver = activeConnectionForResolver != null
-                ? activeConnectionForResolver.ResolveConfigForBroadcast
-                : null;
+            // Always built over the connection's own network, container, randoms and configs: every
+            // API client on an entity must observe the same state, even after a wholesale
+            // ServerReplace. ResolveConfigForBroadcast lets the client's broadcast replay
+            // materialize the right config when the server's ExecutedConfigVersion drifts from the
+            // session pin.
             var apiClient = (TApiClient)config.ApiClientFactory(
-                network,
+                connection.Network,
                 _serializer,
-                stateContainer,
+                connection.StateContainer,
                 _modeProvider,
                 _diagnostics,
                 this,
-                optimisticRandom,
-                entityConfig,
-                namedRandoms,
-                configResolver,
-                serviceConfigs);
+                connection.OptimisticRandom,
+                connection.Config,
+                connection.NamedRandoms,
+                connection.ResolveConfigForBroadcast,
+                connection.Configs);
 
-            // Cache connection
             lock (_lock)
             {
-                if (!TryGetConnection(entityId, config.StateType, out var connection))
+                // Disconnected while the client was being built — its network is already torn down.
+                if (!TryGetConnection(entityId, config.StateType, out var current) || !ReferenceEquals(current, connection))
                 {
-                    connection = newConnection ?? throw new InvalidOperationException(
-                        "Internal: connection went missing between subscribe and cache.");
-                    SetConnection(entityId, config.StateType, connection);
+                    (apiClient as IDisposable)?.Dispose();
+                    throw SubscribeCancelled(entityId, config.StateType);
                 }
-                else if (newConnection != null && !ReferenceEquals(connection, newConnection))
+
+                // Two concurrent resolves of the same client type: the first one cached wins, so
+                // every caller ends up holding the one instance the cache hands out.
+                if (connection.ApiClients.TryGetValue(typeof(TApiClient), out var winner))
                 {
-                    // Lost a race — another caller cached a connection while we were subscribing.
-                    // Tear down our orphan handler so the network doesn't get a duplicate listener.
-                    newConnection.Dispose();
+                    (apiClient as IDisposable)?.Dispose();
+                    return (TApiClient)winner;
                 }
 
                 connection.ApiClients[typeof(TApiClient)] = apiClient;
@@ -477,6 +384,176 @@ namespace SharedMeta.Client
             }
 
             return apiClient;
+        }
+
+        /// <summary>
+        /// Cached connection, or the one a subscribe already in flight produces, or a fresh
+        /// subscribe. <c>Created</c> is true only for the caller whose subscribe built it.
+        /// <para>
+        /// Concurrent resolves of one (entityId, StateType) must share a single subscribe. Each one
+        /// used to subscribe on its own; the loser disposed its network, yet the ApiClient built on
+        /// that network still landed in the winner's cache — a client that threw on every call and
+        /// that re-resolving handed straight back.
+        /// </para>
+        /// </summary>
+        private async Task<(EntityConnection Connection, bool Created)> GetOrSubscribeConnectionAsync(string entityId, MetaServiceConfig config)
+        {
+            var key = (entityId, config.StateType);
+            PendingSubscribe pending;
+            bool owner = false;
+            lock (_lock)
+            {
+                if (TryGetConnection(entityId, config.StateType, out var cached))
+                    return (cached, false);
+
+                if (!_pendingSubscribes.TryGetValue(key, out pending!))
+                {
+                    pending = new PendingSubscribe();
+                    _pendingSubscribes[key] = pending;
+                    owner = true;
+                }
+            }
+
+            // Not awaited: a disconnect fails Completion at once, and the owner must not keep its
+            // caller waiting for the network call the disconnect just abandoned.
+            if (owner)
+                _ = RunSubscribeAsync(pending, entityId, config);
+
+            return (await pending.Completion.Task, owner);
+        }
+
+        // Never throws: the outcome lands in pending.Completion, which every joined caller awaits.
+        private async Task RunSubscribeAsync(PendingSubscribe pending, string entityId, MetaServiceConfig config)
+        {
+            var key = (entityId, config.StateType);
+            EntityConnection connection;
+            try
+            {
+                connection = await CreateConnectionAsync(entityId, config);
+            }
+            catch (Exception ex)
+            {
+                // Dropping the entry lets the next resolve retry instead of replaying the failure.
+                lock (_lock) RemovePendingIfCurrent(key, pending);
+                pending.Completion.TrySetException(ex);
+                return;
+            }
+
+            bool landed;
+            bool unsubscribe = false;
+            lock (_lock)
+            {
+                landed = RemovePendingIfCurrent(key, pending);
+                if (landed)
+                {
+                    SetConnection(entityId, config.StateType, connection);
+                }
+                else
+                {
+                    // A disconnect dropped this subscribe mid-flight and already failed its waiters.
+                    // Skip the unsubscribe if the entity was resolved again meanwhile — it would end
+                    // the server-side subscription the new resolve depends on.
+                    unsubscribe = pending.UnsubscribeOnCancel
+                        && !_pendingSubscribes.ContainsKey(key)
+                        && !TryGetConnection(entityId, config.StateType, out _);
+                }
+            }
+
+            if (landed)
+            {
+                pending.Completion.TrySetResult(connection);
+                return;
+            }
+
+            // Never cached, so nobody else holds it.
+            connection.Dispose();
+            if (unsubscribe && _unsubscriber != null)
+            {
+                try { await _unsubscriber(entityId, StateKey(config.StateType)); }
+                catch (Exception ex)
+                {
+                    Core.Logging.MetaLog.Warning($"[MetaServiceResolver] Unsubscribe of cancelled subscribe to '{entityId}' failed: {ex.Message}");
+                }
+            }
+        }
+
+        // Caller holds _lock.
+        private bool RemovePendingIfCurrent((string, Type) key, PendingSubscribe pending)
+        {
+            if (!_pendingSubscribes.TryGetValue(key, out var current) || !ReferenceEquals(current, pending))
+                return false;
+            _pendingSubscribes.Remove(key);
+            return true;
+        }
+
+        // Caller holds _lock. Fails the waiters now; the subscribe's owner tears the connection down
+        // once its network call returns.
+        private void CancelPending((string EntityId, Type StateType) key, PendingSubscribe pending, bool unsubscribe)
+        {
+            pending.UnsubscribeOnCancel = unsubscribe;
+            pending.Completion.TrySetException(SubscribeCancelled(key.EntityId, key.StateType));
+        }
+
+        private static OperationCanceledException SubscribeCancelled(string entityId, Type stateType) =>
+            new OperationCanceledException(
+                $"Entity '{entityId}' ({stateType.Name}) was disconnected while it was being subscribed.");
+
+        private async Task<EntityConnection> CreateConnectionAsync(string entityId, MetaServiceConfig config)
+        {
+            var subResult = await _networkFactory(entityId, StateKey(config.StateType));
+
+            object initialState;
+            if (subResult.StateBytes != null && subResult.StateBytes.Length > 0)
+            {
+                initialState = _serializer.Unpack(config.StateType, subResult.StateBytes)
+                    ?? throw new InvalidOperationException($"Failed to deserialize state of type '{config.StateType.Name}'");
+            }
+            else
+            {
+                initialState = Activator.CreateInstance(config.StateType)
+                    ?? throw new InvalidOperationException($"Failed to create state of type '{config.StateType.Name}'");
+            }
+
+            var stateContainer = CreateContainer(config, initialState);
+
+            // Deserialize optimistic random, or create from entityId seed
+            MetaRandom? optimisticRandom = subResult.OptimisticRandomBytes is { Length: > 0 } orBytes
+                ? _serializer.Unpack<MetaRandom>(orBytes)
+                : MetaRandom.FromString(entityId + ":optimistic");
+
+            // Null when state has no [NamedRandom] declarations
+            MetaRandom[]? namedRandoms = subResult.NamedRandomsBytes is { Length: > 0 } nrBytes
+                ? _serializer.Unpack<MetaRandom[]>(nrBytes)
+                : null;
+
+            var entityConfig = await ResolveConfigAsync(config, subResult, entityId);
+            var serviceConfigs = await ResolveServiceConfigsAsync(config, subResult, entityId);
+
+            var connection = new EntityConnection
+            {
+                EntityId = entityId,
+                Network = subResult.Network,
+                StateType = config.StateType,
+                StateContainer = stateContainer,
+                OptimisticRandom = optimisticRandom,
+                NamedRandoms = namedRandoms,
+                Config = entityConfig,
+                ConfigType = config.ConfigType,
+                ConfigVersions = subResult.ConfigVersions,
+                Configs = serviceConfigs,
+            };
+
+            // Version-specific config fetcher, so drift detection (broadcasts carrying a different
+            // ExecutedConfigVersion than the session) can lazily materialize the right config for replay.
+            if (config.ConfigType != null && _configProviders.TryGetValue(config.ConfigType, out var versionFetcher))
+                connection.VersionedConfigFetcher = versionFetcher;
+
+            // Entity-level broadcast handler: applies state-data (StateBytes / PatchBytes) to the
+            // shared container regardless of which service the broadcast came from. This is what
+            // lets a client that subscribed to only one of several services on the entity still
+            // receive every state update.
+            connection.SubscribeBroadcasts(_serializer, ResolvePatchApplier(config), LookupConfigByMethodId, this, InstallStateResync);
+            return connection;
         }
 
         public Task DisconnectAsync(string entityId)
@@ -490,6 +567,16 @@ namespace SharedMeta.Client
                 {
                     connections = new List<EntityConnection>(byType.Values);
                     _connections.Remove(entityId);
+                }
+
+                if (_pendingSubscribes.Count > 0)
+                {
+                    foreach (var pending in new List<KeyValuePair<(string EntityId, Type StateType), PendingSubscribe>>(_pendingSubscribes))
+                    {
+                        if (pending.Key.EntityId != entityId) continue;
+                        _pendingSubscribes.Remove(pending.Key);
+                        CancelPending(pending.Key, pending.Value, unsubscribe: true);
+                    }
                 }
             }
 
@@ -507,6 +594,13 @@ namespace SharedMeta.Client
             lock (_lock)
             {
                 RemoveConnection(entityId, typeof(TState), out connection);
+
+                var key = (entityId, typeof(TState));
+                if (_pendingSubscribes.TryGetValue(key, out var pending))
+                {
+                    _pendingSubscribes.Remove(key);
+                    CancelPending(key, pending, unsubscribe: true);
+                }
             }
 
             return connection != null
@@ -883,74 +977,16 @@ namespace SharedMeta.Client
                 throw new InvalidOperationException($"No service config registered for state type '{stateTypeName}'");
             var config = stateEntry.Config;
 
-            bool alreadyConnected;
-            lock (_lock)
-            {
-                alreadyConnected = TryGetConnection(entityId, config.StateType, out _);
-            }
-
-            if (alreadyConnected) return;
-
-            // Create connection (subscribe to entity)
-            var subResult = await _networkFactory(entityId, stateTypeName);
-
-            object initialState;
-            if (subResult.StateBytes != null && subResult.StateBytes.Length > 0)
-            {
-                initialState = _serializer.Unpack(config.StateType, subResult.StateBytes)
-                    ?? throw new InvalidOperationException($"Failed to deserialize state of type '{config.StateType.Name}'");
-            }
-            else
-            {
-                initialState = Activator.CreateInstance(config.StateType)
-                    ?? throw new InvalidOperationException($"Failed to create state of type '{config.StateType.Name}'");
-            }
-
-            var stateContainer = CreateContainer(config, initialState);
-
-            MetaRandom? optimisticRandom = null;
-            if (subResult.OptimisticRandomBytes != null && subResult.OptimisticRandomBytes.Length > 0)
-                optimisticRandom = _serializer.Unpack<MetaRandom>(subResult.OptimisticRandomBytes);
-            else
-                optimisticRandom = MetaRandom.FromString(entityId + ":optimistic");
-
-            MetaRandom[]? namedRandoms = null;
-            if (subResult.NamedRandomsBytes is { Length: > 0 } nrBytes)
-                namedRandoms = _serializer.Unpack<MetaRandom[]>(nrBytes);
-
-            var entityConfig = await ResolveConfigAsync(config, subResult, entityId);
-            var serviceConfigs = await ResolveServiceConfigsAsync(config, subResult, entityId);
-
-            EntityConnection? newConnection = new EntityConnection
-            {
-                EntityId = entityId,
-                Network = subResult.Network,
-                StateType = config.StateType,
-                StateContainer = stateContainer,
-                OptimisticRandom = optimisticRandom,
-                NamedRandoms = namedRandoms,
-                Config = entityConfig,
-                ConfigType = config.ConfigType,
-                ConfigVersions = subResult.ConfigVersions,
-                Configs = serviceConfigs,
-            };
-            newConnection.SubscribeBroadcasts(_serializer, ResolvePatchApplier(config), LookupConfigByMethodId, this, InstallStateResync);
-            if (!string.IsNullOrEmpty(config.ServiceName))
-                newConnection.LocalServiceNames.Add(config.ServiceName);
-            foreach (var methodId in config.MethodIds)
-                newConnection.LocalMethodIds.Add(methodId);
+            var (connection, created) = await GetOrSubscribeConnectionAsync(entityId, config);
+            if (!created) return;
 
             lock (_lock)
             {
-                if (!TryGetConnection(entityId, config.StateType, out _))
-                {
-                    SetConnection(entityId, config.StateType, newConnection);
-                    newConnection = null;
-                }
+                if (!string.IsNullOrEmpty(config.ServiceName))
+                    connection.LocalServiceNames.Add(config.ServiceName);
+                foreach (var methodId in config.MethodIds)
+                    connection.LocalMethodIds.Add(methodId);
             }
-
-            // Lost the race — another caller already cached a connection. Drop the orphan.
-            newConnection?.Dispose();
         }
 
         object ICrossEntityResolver.GetEntityState(string entityId, string stateTypeName)
@@ -1111,6 +1147,11 @@ namespace SharedMeta.Client
                         dropped.Add(connection);
                 }
                 _connections.Clear();
+
+                // The session these subscribes went out on is gone — no unsubscribe to send.
+                foreach (var pending in _pendingSubscribes)
+                    CancelPending(pending.Key, pending.Value, unsubscribe: false);
+                _pendingSubscribes.Clear();
             }
 
             if (announce)
@@ -1235,6 +1276,16 @@ namespace SharedMeta.Client
         public void Dispose()
         {
             ClearAllConnections(announce: false);
+        }
+
+        private sealed class PendingSubscribe
+        {
+            // Continuations run asynchronously: the completion is set under _lock on cancel, and a
+            // waiter resuming inline there would run game code inside the resolver's lock.
+            public readonly TaskCompletionSource<EntityConnection> Completion =
+                new TaskCompletionSource<EntityConnection>(TaskCreationOptions.RunContinuationsAsynchronously);
+            // DisconnectAsync ends the server-side subscription too; a session restart has none left to end.
+            public bool UnsubscribeOnCancel;
         }
 
         private class EntityConnection : IDisposable

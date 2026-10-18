@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.45.1] - 2026-10-18
+
+Concurrent resolves of one entity no longer leave a dead API client in the cache.
+
+### Fixed
+
+- Two concurrent `GetServiceAsync` calls for one entity could cache an API client that threw `ObjectDisposedException` on every call; concurrent resolves now share one subscribe and one live client.
+- A cross-entity subscribe racing `GetServiceAsync` on the same entity no longer kills the API client either.
+- `DisconnectAsync` / supersede restart during an in-flight subscribe fails that resolve with `OperationCanceledException` instead of caching the dropped connection afterwards.
+
 ## [0.45.0] - 2026-10-14
 
 Cross-entity calls to Query methods no longer broadcast to the target's subscribers.
