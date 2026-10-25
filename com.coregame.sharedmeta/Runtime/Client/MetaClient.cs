@@ -1,6 +1,6 @@
 using System;
 using System.Collections.Generic;
-#if !NETSTANDARD2_1
+#if !NETSTANDARD2_1 && !UNITY_5_3_OR_NEWER
 using System.Net.Http;
 using System.Net.Http.Json;
 #endif
@@ -580,7 +580,7 @@ namespace SharedMeta.Client
             Connection.Dispose();
         }
 
-#if !NETSTANDARD2_1
+#if !NETSTANDARD2_1 && !UNITY_5_3_OR_NEWER
         /// <summary>
         /// Authenticate with the server using a DeviceId.
         /// Returns a login result with JWT token and PlayerId.
