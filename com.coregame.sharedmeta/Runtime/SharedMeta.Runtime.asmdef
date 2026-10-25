@@ -19,16 +19,6 @@
             "name": "com.github.messagepack-csharp",
             "expression": "0.0.0",
             "define": "HAS_MESSAGEPACK"
-        },
-        {
-            "name": "com.cysharp.zlogger",
-            "expression": "0.0.0",
-            "define": "HAS_LOGGING_ABSTRACTIONS"
-        },
-        {
-            "name": "org.nuget.microsoft.extensions.logging.abstractions",
-            "expression": "0.0.0",
-            "define": "HAS_LOGGING_ABSTRACTIONS"
         }
   ],
   "noEngineReferences": true
