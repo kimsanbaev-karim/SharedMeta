@@ -1,4 +1,3 @@
-#if !UNITY_5_3_OR_NEWER || HAS_LOGGING_ABSTRACTIONS
 using System;
 using Microsoft.Extensions.Logging;
 
@@ -7,11 +6,6 @@ namespace SharedMeta.Core.Logging
     /// <summary>
     /// Routes SharedMeta logging into a Microsoft.Extensions.Logging <see cref="ILogger"/>,
     /// so any logger built on it (console, ZLogger, Serilog, ...) receives SharedMeta output.
-    /// <para>
-    /// Unity builds compile it when <c>HAS_LOGGING_ABSTRACTIONS</c> is defined: automatically with
-    /// ZLogger or the OpenUPM Microsoft.Extensions.Logging.Abstractions package, or by hand as a
-    /// scripting define when the DLL comes from elsewhere (e.g. NuGetForUnity).
-    /// </para>
     /// </summary>
     public sealed class LoggerAdapter : IMetaLogger
     {
@@ -42,4 +36,3 @@ namespace SharedMeta.Core.Logging
         };
     }
 }
-#endif
